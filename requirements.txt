@@ -1,0 +1,6 @@
+requests>=2.32.0
+pydub>=0.25.1
+diskcache>=5.6.3
+langdetect>=1.0.9
+openai>=1.0.0
+PyQt5>=5.15.0

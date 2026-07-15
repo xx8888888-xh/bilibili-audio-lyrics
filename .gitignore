@@ -1,0 +1,38 @@
+# 开源项目源码（体积大，不提交，用户自行克隆）
+VideoCaptioner-master/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 构建产物（中间文件，build.spec 需提交以便重新打包）
+build/
+build_log.txt
+
+# exe 二进制文件（作为 Release 资产发布，不纳入 git 版本控制）
+dist/
+
+# 测试输出
+test_output/
+test_output_multi/
+output/
+
+# GitHub token（敏感信息）
+github_token_*.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 临时辅助脚本
+_write_*.py
