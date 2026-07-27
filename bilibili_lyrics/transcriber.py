@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """音频转录模块
 
-调用 VideoCaptioner 开源项目的转录功能，将音频文件转录为带时间戳的文本段落。
-使用必剪引擎（BcutASR），免费、无需 API Key、无需 GPU、无需登录。
+调用 VideoCaptioner 开源项目的 BcutASR（必剪引擎），将音频文件转录为带时间戳的文本段落。
+使用必剪引擎（BcutASR）：免费、无需 API Key、无需 GPU、无需登录。
+
+为了避免打包体积过大以及运行环境缺少 ffmpeg，本模块直接实例化 BcutASR，绕过 ChunkedASR
+与 pydub 的音频分块流程。BcutASR 本身仅将音频字节上传到 B站云 ASR 服务，不依赖本地 ffmpeg。
 """
 
 import os
@@ -15,6 +18,19 @@ os.environ['NO_PROXY'] = '*'
 os.environ['no_proxy'] = '*'
 
 
+# 估算音频时长（秒），用于 BaseASR 内部的速率限制统计。
+# 由于绕过了 pydub，不再调用 ffmpeg；对 192kbps CBR MP3 用文件大小估算即可。
+def _estimate_audio_duration(file_binary: bytes) -> float:
+    """根据文件大小估算音频时长（秒）
+
+    当前输出固定为 192kbps CBR MP3，可用 bytes / (192000/8) 估算。
+    对于其他格式，按保守值 192kbps 估算；若为空则返回最小值。
+    """
+    if not file_binary:
+        return 0.01
+    return len(file_binary) / 24000
+
+
 def _resolve_vc_path() -> str:
     """解析 VideoCaptioner 项目路径
 
@@ -22,13 +38,11 @@ def _resolve_vc_path() -> str:
     1. PyInstaller 打包环境：_MEIPASS/VideoCaptioner-master
     2. 开发环境：项目根目录下的 VideoCaptioner-master
     """
-    # PyInstaller 打包后，资源会被解压到 sys._MEIPASS
     if hasattr(sys, '_MEIPASS'):
         packed_path = os.path.join(sys._MEIPASS, "VideoCaptioner-master")
         if os.path.isdir(packed_path):
             return packed_path
 
-    # 开发环境：bilibili_lyrics/ 的父目录下的 VideoCaptioner-master
     dev_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "VideoCaptioner-master"
@@ -41,8 +55,18 @@ VC_PATH = _resolve_vc_path()
 if VC_PATH not in sys.path:
     sys.path.insert(0, VC_PATH)
 
-from videocaptioner.core.asr.transcribe import transcribe
-from videocaptioner.core.entities import TranscribeConfig, TranscribeModelEnum
+from videocaptioner.core.asr.bcut import BcutASR
+from videocaptioner.core.asr.base import BaseASR
+
+
+# 绕过 pydub：直接替换 BaseASR 的音频时长计算方法，避免运行时报
+# "ffmpeg not found" 或 JSONDecodeError（ffprobe 缺失导致）。
+# BcutASR 上传的是原始文件字节，服务端完成解码，本地无需 ffmpeg。
+def _get_audio_duration_patched(self) -> float:
+    return _estimate_audio_duration(self.file_binary)
+
+
+BaseASR._get_audio_duration = _get_audio_duration_patched
 
 
 # 支持的音频文件扩展名
@@ -52,15 +76,12 @@ SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac"}
 class AudioTranscriber:
     """音频转录器
 
-    封装 VideoCaptioner 的转录功能，将音频文件转录为带时间戳的文本段落。
-    默认使用必剪引擎（BcutASR）：免费、无需 API Key、无需 GPU、无需登录。
+    直接调用 VideoCaptioner 的 BcutASR（必剪引擎），将音频文件转录为带时间戳的文本段落。
+    免费、无需 API Key、无需 GPU、无需登录，且不依赖本地 ffmpeg。
     """
 
     def __init__(self):
-        """初始化转录器
-
-        VideoCaptioner 路径已在模块导入时加入 sys.path，此处无需额外操作。
-        """
+        """初始化转录器"""
         return
 
     def transcribe(
@@ -98,18 +119,15 @@ class AudioTranscriber:
                 f"仅支持: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}"
             )
 
-        # 构建转录配置：必剪引擎，自动检测语言，句级时间戳
-        config = TranscribeConfig(
-            transcribe_model=TranscribeModelEnum.BIJIAN,  # 必剪引擎，免费
-            transcribe_language="",  # 空字符串=自动检测语言
-            need_word_time_stamp=False,  # 句级时间戳（不是词级），适合生成歌词
-        )
-
-        # 调用 VideoCaptioner 进行转录
+        # 直接调用 BcutASR，绕过 ChunkedASR/pydub
         try:
-            asr_data = transcribe(audio_path, config, callback=progress_callback)
+            asr = BcutASR(
+                audio_path,
+                use_cache=False,
+                need_word_time_stamp=False,
+            )
+            asr_data = asr.run(callback=progress_callback)
         except Exception as e:
-            # 捕获转录过程中的异常，包装为 RuntimeError 抛出
             raise RuntimeError(f"转录过程失败: {e}") from e
 
         # 检查转录结果是否为空
@@ -119,13 +137,15 @@ class AudioTranscriber:
         # 遍历 segments，转换为接口要求的格式
         segments: list[dict] = []
         for seg in asr_data.segments:
-            segments.append(
-                {
-                    "start_ms": seg.start_time,
-                    "end_ms": seg.end_time,
-                    "text": seg.text.strip(),
-                }
-            )
+            text = seg.text.strip() if seg.text else ""
+            if text:
+                segments.append(
+                    {
+                        "start_ms": seg.start_time,
+                        "end_ms": seg.end_time,
+                        "text": text,
+                    }
+                )
 
         # 再次校验转换后的结果
         if not segments:

@@ -14,6 +14,26 @@ from datetime import datetime
 from typing import Optional
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal, Qt
+
+
+DEFAULT_OUTPUT_FOLDER_NAME = "哔哩哔哩 video 下载"
+
+
+def _default_output_dir() -> str:
+    """返回默认输出目录：用户下载目录下的 '哔哩哔哩 video 下载' 文件夹
+
+    第一次运行或目录不存在时会自动创建。
+    兼容 Windows / macOS / Linux。
+    """
+    downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+    # Windows 中文系统下 Downloads 可能指向 '下载'，如果该路径不存在则回退到桌面
+    if sys.platform == "win32" and not os.path.isdir(downloads):
+        downloads = os.path.join(os.path.expanduser("~"), "下载")
+    output_dir = os.path.join(downloads, DEFAULT_OUTPUT_FOLDER_NAME)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QTextEdit, QProgressBar, QFileDialog,
@@ -149,7 +169,7 @@ class MainWindow(QMainWindow):
         dir_label.setMinimumWidth(80)
         self.dir_input = QLineEdit()
         self.dir_input.setPlaceholderText("选择输出目录")
-        self.dir_input.setText(os.path.join(os.getcwd(), "output"))
+        self.dir_input.setText(_default_output_dir())
         self.browse_btn = QPushButton("浏览")
         self.browse_btn.clicked.connect(self._browse_dir)
         dir_row.addWidget(dir_label)
