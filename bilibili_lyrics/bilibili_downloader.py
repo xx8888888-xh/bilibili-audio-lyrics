@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """B站音频下载模块
 
-通过WBI签名调用B站API获取DASH音频流，下载并使用ffmpeg转封装为m4a格式（无损、秒级完成）。
-仅依赖 requests 和 ffmpeg，不依赖任何其他项目模块。
+通过WBI签名调用B站API获取DASH音频流，下载并转码为MP3格式（192kbps CBR，
+兼容所有主流播放器和转录工具）。优先使用 ffmpeg 直接转码；当 ffmpeg 缺少音频编解码器时，
+自动使用项目内置的 FlicFlac 工具包（faad + lame）进行解码和编码。
 """
 
 import os
 import re
+import sys
+import shutil
 import time
 import hashlib
 import subprocess
@@ -83,7 +86,9 @@ def _build_wbi_params(params: dict, img_key: str, sub_key: str) -> dict:
 class BilibiliAudioDownloader:
     """B站音频下载器
 
-    通过WBI签名调用B站API获取DASH音频流，下载并转封装为m4a格式。
+    通过WBI签名调用B站API获取DASH音频流，下载并转码为MP3格式（192kbps CBR）。
+    优先使用 ffmpeg 直接转码；当 ffmpeg 缺少音频编解码器时，
+    自动使用项目内置的 FlicFlac 工具包（faad + lame）。
     """
 
     def __init__(self, sessdata: str = None):
@@ -414,31 +419,150 @@ class BilibiliAudioDownloader:
                     time.sleep(1 * (attempt + 1))
         raise RuntimeError(f"音频流下载失败（已重试3次）: {last_error}")
 
-    def _convert_to_m4a(self, input_path: str, output_path: str) -> None:
-        """用ffmpeg将m4s转封装为m4a（无损、秒级完成）
+    @staticmethod
+    def _resolve_flicflac_tool(tool_name: str) -> str:
+        """解析项目内置的 FlicFlac 工具路径
+
+        优先级：
+        1. PyInstaller 打包环境：sys._MEIPASS/FlicFlac-master/<tool>.exe
+        2. 开发环境：项目根目录下的 FlicFlac-master/<tool>.exe
+
+        Args:
+            tool_name: 工具名（如 faad、lame，不带 .exe）
+
+        Returns:
+            工具的绝对路径
+        """
+        exe_name = f"{tool_name}.exe"
+        if hasattr(sys, '_MEIPASS'):
+            packed_path = os.path.join(sys._MEIPASS, "FlicFlac-master", exe_name)
+            if os.path.isfile(packed_path):
+                return packed_path
+
+        dev_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "FlicFlac-master", exe_name
+        )
+        return dev_path
+
+    def _m4a_to_mp3(self, m4a_path: str, mp3_path: str) -> None:
+        """使用 FlicFlac 的 faad + lame 将 m4a 转为 mp3"""
+        faad_path = self._resolve_flicflac_tool("faad")
+        lame_path = self._resolve_flicflac_tool("lame")
+        if not os.path.isfile(faad_path):
+            raise RuntimeError(f"项目内置的 faad.exe 不存在: {faad_path}")
+        if not os.path.isfile(lame_path):
+            raise RuntimeError(f"项目内置的 lame.exe 不存在: {lame_path}")
+
+        temp_wav = mp3_path + ".tmp.wav"
+        try:
+            # faad: m4a -> wav
+            cmd = [faad_path, "-q", "-o", temp_wav, m4a_path]
+            result = subprocess.run(cmd, capture_output=True, timeout=180)
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8', errors='ignore')
+                raise RuntimeError(f"faad 解码失败: {stderr}")
+
+            # lame: wav -> mp3 (192kbps CBR)
+            cmd = [lame_path, "-q", "2", "-b", "192", temp_wav, mp3_path]
+            result = subprocess.run(cmd, capture_output=True, timeout=180)
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8', errors='ignore')
+                raise RuntimeError(f"lame 编码失败: {stderr}")
+        finally:
+            try:
+                os.remove(temp_wav)
+            except OSError:
+                pass
+
+    def _convert_to_mp3(self, input_path: str, output_path: str) -> None:
+        """将下载的m4s音频流转码为MP3格式
+
+        优先使用 ffmpeg 直接 m4s -> mp3；
+        当 ffmpeg 缺少音频编解码器时，先使用 ffmpeg 将 m4s 无损封装为 m4a，
+        再调用项目内置的 FlicFlac（faad + lame）转码为 MP3（192kbps CBR）。
 
         Args:
             input_path: 输入m4s文件路径
-            output_path: 输出m4a文件路径
+            output_path: 输出mp3文件路径
 
         Raises:
-            RuntimeError: ffmpeg未找到或转封装失败
+            RuntimeError: 转码失败或没有任何可用解码器
         """
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vn", "-c:a", "copy",
-            output_path
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=120)
-        except FileNotFoundError:
-            raise RuntimeError("未找到ffmpeg，请确保ffmpeg已安装并加入PATH")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("ffmpeg转封装超时")
-        if result.returncode != 0:
-            stderr = result.stderr.decode('utf-8', errors='ignore')
-            raise RuntimeError(f"ffmpeg转封装失败: {stderr}")
+        # 1. 优先尝试 ffmpeg 直接 m4s -> mp3
+        if shutil.which("ffmpeg"):
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-vn",
+                "-c:a", "libmp3lame",
+                "-b:a", "192k",
+                output_path
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
+            except FileNotFoundError:
+                pass
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("ffmpeg 转码超时")
+            else:
+                if result.returncode == 0:
+                    return
+                # 直接 mp3 失败，尝试 ffmpeg 仅做 m4s -> m4a 封装（-c:a copy 不需要编解码器）
+                stderr = result.stderr.decode('utf-8', errors='ignore')
+                temp_m4a = output_path + ".tmp.mp4"
+                try:
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", input_path,
+                        "-vn",
+                        "-c:a", "copy",
+                        "-f", "mp4",
+                        temp_m4a
+                    ]
+                    result2 = subprocess.run(cmd, capture_output=True, timeout=120)
+                    if result2.returncode == 0:
+                        self._m4a_to_mp3(temp_m4a, output_path)
+                        return
+                    stderr2 = result2.stderr.decode('utf-8', errors='ignore')
+                    raise RuntimeError(
+                        f"ffmpeg 直接转 mp3 失败: {stderr}\n"
+                        f"ffmpeg 封装 m4a 也失败: {stderr2}"
+                    )
+                finally:
+                    try:
+                        os.remove(temp_m4a)
+                    except OSError:
+                        pass
+
+        # 2. 无 ffmpeg 时，尝试直接用 FlicFlac/faad 解码 m4s（部分 m4s 可被识别）
+        faad_path = self._resolve_flicflac_tool("faad")
+        lame_path = self._resolve_flicflac_tool("lame")
+        if os.path.isfile(faad_path) and os.path.isfile(lame_path):
+            temp_wav = output_path + ".tmp.wav"
+            try:
+                cmd = [faad_path, "-q", "-o", temp_wav, input_path]
+                result = subprocess.run(cmd, capture_output=True, timeout=180)
+                if result.returncode == 0:
+                    cmd = [lame_path, "-q", "2", "-b", "192", temp_wav, output_path]
+                    result2 = subprocess.run(cmd, capture_output=True, timeout=180)
+                    if result2.returncode == 0:
+                        return
+                    stderr2 = result2.stderr.decode('utf-8', errors='ignore')
+                    raise RuntimeError(f"lame 编码失败: {stderr2}")
+                stderr = result.stderr.decode('utf-8', errors='ignore')
+                raise RuntimeError(
+                    f"faad 解码失败（无 ffmpeg 时无法预封装 m4s）: {stderr}"
+                )
+            finally:
+                try:
+                    os.remove(temp_wav)
+                except OSError:
+                    pass
+
+        raise RuntimeError(
+            "未找到可用的 ffmpeg 或项目内置的 FlicFlac 工具包（faad.exe + lame.exe）。"
+        )
 
     def _sanitize_filename(self, name: str) -> str:
         """去除文件名中的非法字符（替换为下划线）
@@ -463,7 +587,7 @@ class BilibiliAudioDownloader:
 
         Returns:
             dict: {
-                "audio_path": str,  # 下载的音频文件完整路径（.m4a格式）
+                "audio_path": str,  # 下载的音频文件完整路径（.mp3格式）
                 "title": str,       # 视频标题
                 "bvid": str,        # BV号
                 "cid": str,         # 视频CID
@@ -504,24 +628,24 @@ class BilibiliAudioDownloader:
         os.makedirs(output_dir, exist_ok=True)
         safe_title = self._sanitize_filename(title)
         temp_m4s = os.path.join(output_dir, f"{safe_title}.m4s")
-        output_m4a = os.path.join(output_dir, f"{safe_title}.m4a")
+        output_mp3 = os.path.join(output_dir, f"{safe_title}.mp3")
 
         _progress(30, "开始下载音频...")
         self._download_audio_stream(audio, temp_m4s, bvid, progress_callback)
         _progress(90, "音频下载完成")
 
-        # ========== 90-100%: ffmpeg转封装 ==========
-        _progress(92, "ffmpeg转封装中...")
-        self._convert_to_m4a(temp_m4s, output_m4a)
+        # ========== 90-100%: 转码为MP3 ==========
+        _progress(92, "转码为MP3中...")
+        self._convert_to_mp3(temp_m4s, output_mp3)
         # 删除临时m4s文件
         try:
             os.remove(temp_m4s)
         except OSError:
             pass
-        _progress(100, f"完成: {output_m4a}")
+        _progress(100, f"完成: {output_mp3}")
 
         return {
-            "audio_path": output_m4a,
+            "audio_path": output_mp3,
             "title": title,
             "bvid": bvid,
             "cid": cid,

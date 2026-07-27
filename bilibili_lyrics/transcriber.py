@@ -71,7 +71,7 @@ class AudioTranscriber:
         """转录音频文件为带时间戳的文本段落
 
         Args:
-            audio_path: 音频文件路径（支持 mp3/m4a/wav/flac）
+            audio_path: 音频文件路径（支持 mp3/wav/flac/m4a）
             progress_callback: 进度回调函数 callback(progress: int, message: str)
                               progress 为 0-100
 

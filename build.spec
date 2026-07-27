@@ -8,10 +8,14 @@ block_cipher = None
 
 # 收集 VideoCaptioner 的所有数据文件和子模块
 vc_path = os.path.join(os.getcwd(), "VideoCaptioner-master")
+# 收集 FlicFlac 工具包（无 ffmpeg 时用作 WAV 解码回退）
+flicflac_path = os.path.join(os.getcwd(), "FlicFlac-master")
 
 datas = []
 # 添加 VideoCaptioner 整个目录作为数据文件
 datas.append((vc_path, "VideoCaptioner-master"))
+# 添加 FlicFlac 工具包作为数据文件
+datas.append((flicflac_path, "FlicFlac-master"))
 
 # 收集 videocaptioner 包的数据文件（如果有）
 datas += collect_data_files("videocaptioner")
