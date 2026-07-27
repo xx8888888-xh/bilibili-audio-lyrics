@@ -10,12 +10,19 @@ block_cipher = None
 vc_path = os.path.join(os.getcwd(), "VideoCaptioner-master")
 # 收集 FlicFlac 工具包（无 ffmpeg 时用作 WAV 解码回退）
 flicflac_path = os.path.join(os.getcwd(), "FlicFlac-master")
+# 收集 Whisper.cpp 运行时（含 DLL）和 small 模型
+whisper_path = os.path.join(os.getcwd(), "whisper_test", "Release")
+model_path = os.path.join(os.getcwd(), "models")
 
 datas = []
 # 添加 VideoCaptioner 整个目录作为数据文件
 datas.append((vc_path, "VideoCaptioner-master"))
 # 添加 FlicFlac 工具包作为数据文件
 datas.append((flicflac_path, "FlicFlac-master"))
+# 添加 Whisper.cpp 运行时目录作为数据文件
+datas.append((whisper_path, os.path.join("whisper_test", "Release")))
+# 添加 Whisper small 模型作为数据文件
+datas.append((model_path, "models"))
 
 # 收集 videocaptioner 包的数据文件（如果有）
 datas += collect_data_files("videocaptioner")

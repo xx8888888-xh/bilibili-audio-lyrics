@@ -17,6 +17,7 @@ dist/
 # 测试输出
 test_output/
 test_output_multi/
+test_output_exe/
 test_cli_output*/
 exe_test/
 exe_isolated_test/

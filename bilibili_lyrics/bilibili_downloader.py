@@ -298,6 +298,184 @@ class BilibiliAudioDownloader:
         )
         return data['data']['title']
 
+    def _get_subtitle_list(self, bvid: str, cid: str) -> tuple:
+        """获取B站官方字幕列表（CC字幕/AI字幕）
+
+        优先调用带WBI签名的 x/player/wbi/v2 接口；如果获取失败，
+        回退到无签名的 x/player/v2 接口。
+
+        Args:
+            bvid: BV号
+            cid: 视频CID
+
+        Returns:
+            (subtitles, need_login) 元组
+            subtitles: 字幕信息列表，每个元素包含 lan、lan_doc、subtitle_url 等字段
+            need_login: 是否需要登录才能查看字幕（bool）
+        """
+        headers = self._get_headers(bvid)
+        need_login = False
+
+        # 1. 优先尝试 WBI 签名接口
+        try:
+            img_key, sub_key = self._get_wbi_keys()
+            signed_params = _build_wbi_params({"bvid": bvid, "cid": cid}, img_key, sub_key)
+            resp = self.session.get(
+                "https://api.bilibili.com/x/player/wbi/v2",
+                params=signed_params,
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get('code') == 0:
+                subtitle_info = data.get('data', {}).get('subtitle', {})
+                subtitles = subtitle_info.get('subtitles', [])
+                # 如果未登录，部分视频的字幕会隐藏；allow_submit=false 且 lan 为空是常见特征
+                if not subtitles and subtitle_info.get('allow_submit') is False and not subtitle_info.get('lan'):
+                    need_login = True
+                if subtitles:
+                    return subtitles, need_login
+        except Exception:
+            pass
+
+        # 2. 回退到无签名接口
+        try:
+            resp = self.session.get(
+                "https://api.bilibili.com/x/player/v2",
+                params={"bvid": bvid, "cid": cid},
+                headers=headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get('code') == 0:
+                subtitle_info = data.get('data', {}).get('subtitle', {})
+                subtitles = subtitle_info.get('subtitles', [])
+                if not subtitles and subtitle_info.get('allow_submit') is False and not subtitle_info.get('lan'):
+                    need_login = True
+                return subtitles, need_login
+        except Exception:
+            pass
+
+        return [], need_login
+
+    @staticmethod
+    def _select_best_subtitle(subtitles: list, preferred_langs: Optional[list] = None) -> Optional[dict]:
+        """从字幕列表中选择最合适的字幕
+
+        选择优先级：
+        1. 优先匹配用户指定的语言代码（如 ja、en、zh-CN）
+        2. 其次选择日语、英语、简体中文、繁体中文
+        3. 最后返回列表第一个字幕
+
+        Args:
+            subtitles: 字幕信息列表
+            preferred_langs: 用户偏好的语言代码列表
+
+        Returns:
+            最佳字幕信息字典，或 None
+        """
+        if not subtitles:
+            return None
+
+        # 语言代码到选择权重的映射（数值越小越优先）
+        lang_priority = {
+            "ja": 1, "jp": 1,           # 日语
+            "en": 2, "en-US": 2,       # 英语
+            "zh-CN": 3, "zh-Hans": 3, "zh": 3, "cmn-hans": 3,
+            "zh-TW": 4, "zh-Hant": 4, "zh-HK": 4, "cmn-hant": 4,
+        }
+        if preferred_langs:
+            for idx, code in enumerate(preferred_langs):
+                lang_priority[code.lower()] = -len(preferred_langs) + idx
+
+        def _score(sub: dict) -> int:
+            lan = (sub.get('lan') or '').lower()
+            return lang_priority.get(lan, 100)
+
+        return min(subtitles, key=_score)
+
+    def _download_subtitle(self, subtitle_url: str, bvid: str) -> list[dict]:
+        """下载并解析字幕JSON
+
+        Args:
+            subtitle_url: 字幕JSON地址（通常以 // 开头）
+            bvid: BV号（用于Referer）
+
+        Returns:
+            字幕段落列表，每个元素包含 start_ms、end_ms、text
+        """
+        if subtitle_url.startswith('//'):
+            subtitle_url = 'https:' + subtitle_url
+
+        resp = self.session.get(subtitle_url, headers=self._get_headers(bvid), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        body = data.get('body', [])
+
+        segments = []
+        for item in body:
+            content = item.get('content', '').strip()
+            if not content:
+                continue
+            start_ms = int(item.get('from', 0) * 1000)
+            end_ms = int(item.get('to', 0) * 1000)
+            segments.append({
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "text": content,
+            })
+        return segments
+
+    def get_official_subtitle(
+        self,
+        url: str,
+        preferred_langs: Optional[list] = None,
+        progress_callback: Callable[[int, str], None] = None,
+    ) -> Optional[tuple]:
+        """尝试获取B站官方字幕
+
+        Args:
+            url: B站视频URL
+            preferred_langs: 偏好语言代码列表
+            progress_callback: 进度回调
+
+        Returns:
+            (segments, language) 元组，如果没有官方字幕则返回 None
+        """
+        def _progress(p: int, msg: str):
+            if progress_callback:
+                progress_callback(p, msg)
+
+        try:
+            _progress(0, "解析URL...")
+            bvid, page = self.parse_url(url)
+            _progress(10, "获取CID...")
+            cid, _ = self._get_cid(bvid, page)
+            _progress(30, "查询官方字幕...")
+            subtitles, need_login = self._get_subtitle_list(bvid, cid)
+            if not subtitles:
+                if need_login:
+                    _progress(100, "官方字幕需要登录后查看，将使用本地识别")
+                else:
+                    _progress(100, "未找到官方字幕")
+                return None
+
+            _progress(50, f"发现 {len(subtitles)} 个字幕，选择最佳匹配...")
+            best = self._select_best_subtitle(subtitles, preferred_langs)
+            if best is None:
+                return None
+
+            lan = best.get('lan', '')
+            lan_doc = best.get('lan_doc', '')
+            _progress(70, f"使用官方字幕: {lan_doc} ({lan})")
+            segments = self._download_subtitle(best['subtitle_url'], bvid)
+            _progress(100, f"官方字幕下载完成，共 {len(segments)} 段")
+            return segments, lan
+        except Exception:
+            return None
+
     def _get_playurl(self, bvid: str, cid: str) -> dict:
         """获取DASH播放地址（需WBI签名）
 

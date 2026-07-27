@@ -13,7 +13,7 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import QObject, QThread, pyqtSignal, Qt
+from PyQt5.QtCore import QObject, QThread, pyqtSignal, Qt, QTimer
 
 
 DEFAULT_OUTPUT_FOLDER_NAME = "哔哩哔哩 video 下载"
@@ -37,7 +37,7 @@ def _default_output_dir() -> str:
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QTextEdit, QProgressBar, QFileDialog,
-    QMessageBox, QFrame, QCheckBox, QSpinBox,
+    QMessageBox, QFrame, QCheckBox, QSpinBox, QComboBox,
 )
 
 
@@ -51,14 +51,29 @@ class WorkerSignals(QObject):
 
 
 class SingleUrlWorker(QThread):
-    """单个URL的歌词生成工作线程：下载→转录→生成歌词"""
+    """单个URL的歌词生成工作线程：下载→优先官方字幕→转录→生成歌词"""
 
-    def __init__(self, url: str, output_dir: str, auto_open: bool = False):
+    def __init__(self, url: str, output_dir: str, language: str = "ja", auto_open: bool = False):
         super().__init__()
         self.url: str = url
         self.output_dir: str = output_dir
+        self.language: str = language
         self.auto_open: bool = auto_open
         self.signals = WorkerSignals()
+
+    def _generate_lrc_from_segments(self, segments: list, title: str) -> str:
+        """使用给定的段落生成 LRC 文件"""
+        from bilibili_lyrics.lrc_generator import generate_lrc
+
+        safe_title = "".join(
+            c if c not in r'\/:*?"<>|' else "_" for c in title
+        )
+        lrc_path = os.path.join(self.output_dir, f"{safe_title}.lrc")
+        generate_lrc(
+            segments, lrc_path,
+            metadata={"title": title, "by": "B站歌词生成器"},
+        )
+        return lrc_path
 
     def run(self) -> None:
         """执行单个URL的工作流程"""
@@ -68,7 +83,6 @@ class SingleUrlWorker(QThread):
             # 懒加载依赖模块（在子线程中导入，避免主线程阻塞）
             from bilibili_lyrics.bilibili_downloader import BilibiliAudioDownloader
             from bilibili_lyrics.transcriber import AudioTranscriber
-            from bilibili_lyrics.lrc_generator import generate_lrc
 
             # 步骤1: 下载音频 (进度 0-40%)
             self.signals.log.emit(f"[{self.url}] 开始下载音频...")
@@ -82,27 +96,35 @@ class SingleUrlWorker(QThread):
             title: str = result["title"]
             self.signals.log.emit(f"[{self.url}] 下载完成: {os.path.basename(audio_path)}")
 
-            # 步骤2: 转录音频 (进度 40-90%)
-            self.signals.log.emit(f"[{self.url}] 开始转录音频...")
-            transcriber = AudioTranscriber()
-            segments = transcriber.transcribe(
-                audio_path,
+            # 步骤2: 优先尝试获取B站官方字幕 (进度 40-60%)
+            self.signals.log.emit(f"[{self.url}] 检查B站官方字幕...")
+            official_sub = downloader.get_official_subtitle(
+                self.url,
+                preferred_langs=["ja", "en", "zh-CN"],
                 progress_callback=lambda p, m: self.signals.progress.emit(
-                    int(40 + p * 0.5), f"转录: {m}")
+                    int(40 + p * 0.2), f"官方字幕: {m}"),
             )
-            self.signals.log.emit(f"[{self.url}] 转录完成，共 {len(segments)} 段")
+            if official_sub:
+                segments, lang = official_sub
+                self.signals.log.emit(
+                    f"[{self.url}] ✅ 使用官方字幕（{lang}），共 {len(segments)} 段"
+                )
+                self.signals.progress.emit(60, f"官方字幕 {lang}")
+            else:
+                # 步骤3: 转录音频 (进度 60-95%)
+                self.signals.log.emit(f"[{self.url}] 未找到官方字幕，开始转录音频...")
+                transcriber = AudioTranscriber()
+                segments = transcriber.transcribe(
+                    audio_path,
+                    language=self.language,
+                    progress_callback=lambda p, m: self.signals.progress.emit(
+                        int(60 + p * 0.35), f"转录: {m}"),
+                )
+                self.signals.log.emit(f"[{self.url}] 转录完成，共 {len(segments)} 段")
 
-            # 步骤3: 生成歌词 (进度 90-100%)
+            # 步骤4: 生成歌词 (进度 95-100%)
             self.signals.log.emit(f"[{self.url}] 正在生成LRC歌词文件...")
-            # 文件名安全化
-            safe_title = "".join(
-                c if c not in r'\/:*?"<>|' else "_" for c in title
-            )
-            lrc_path = os.path.join(self.output_dir, f"{safe_title}.lrc")
-            generate_lrc(
-                segments, lrc_path,
-                metadata={"title": title, "by": "B站歌词生成器"},
-            )
+            lrc_path = self._generate_lrc_from_segments(segments, title)
             self.signals.log.emit(f"[{self.url}] 歌词已保存: {lrc_path}")
 
             self.signals.progress.emit(100, "完成")
@@ -121,6 +143,8 @@ class MainWindow(QMainWindow):
         self.total_tasks = 0
         self.completed_tasks = 0
         self.failed_tasks = 0
+        self._watchdog_timer: Optional[QTimer] = None
+        self._all_finished_called = False  # 防止 _on_all_finished 重复执行
         self._init_ui()
         self._init_style()
 
@@ -129,7 +153,7 @@ class MainWindow(QMainWindow):
     def _init_ui(self) -> None:
         """初始化界面布局"""
         self.setWindowTitle("B站音频歌词生成器 - 批量版")
-        self.setFixedSize(700, 650)
+        self.setFixedSize(700, 680)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -177,14 +201,23 @@ class MainWindow(QMainWindow):
         dir_row.addWidget(self.browse_btn)
         layout.addLayout(dir_row)
 
-        # 选项行：并行数量 + 自动打开
+        # 选项行：语言 + 并行数量 + 自动打开
         opt_row = QHBoxLayout()
+        opt_row.addWidget(QLabel("语言:"))
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItem("日语 (Whisper.cpp)", "ja")
+        self.lang_combo.addItem("英语 (Whisper.cpp)", "en")
+        self.lang_combo.addItem("中文 (BcutASR)", "zh")
+        self.lang_combo.setToolTip("无官方字幕时使用的转录语言")
+        opt_row.addWidget(self.lang_combo)
+        opt_row.addSpacing(20)
+
         opt_row.addWidget(QLabel("并行任务数:"))
         self.parallel_spin = QSpinBox()
         self.parallel_spin.setMinimum(1)
-        self.parallel_spin.setMaximum(5)
+        self.parallel_spin.setMaximum(3)
         self.parallel_spin.setValue(2)
-        self.parallel_spin.setToolTip("同时处理的链接数量（建议2-3，过高可能触发B站风控）")
+        self.parallel_spin.setToolTip("同时处理的链接数量（建议2，过高可能触发B站风控）")
         opt_row.addWidget(self.parallel_spin)
         opt_row.addStretch()
         self.auto_open_chk = QCheckBox("完成后自动打开输出目录")
@@ -261,6 +294,14 @@ class MainWindow(QMainWindow):
                 border-radius: 4px; font-size: 10pt;
                 background-color: #ffffff;
             }
+            QComboBox {
+                padding: 4px; border: 1px solid #dcdde1;
+                border-radius: 4px; font-size: 10pt;
+                background-color: #ffffff;
+                min-width: 140px;
+            }
+            QComboBox:focus { border: 1px solid #3498db; }
+            QComboBox::drop-down { border: none; }
             QProgressBar {
                 border: 1px solid #dcdde1; border-radius: 4px;
                 text-align: center; background-color: #ffffff;
@@ -306,6 +347,7 @@ class MainWindow(QMainWindow):
         self.total_tasks = len(urls)
         self.completed_tasks = 0
         self.failed_tasks = 0
+        self._all_finished_called = False
         self.progress_bar.setValue(0)
         self.status_label.setText(f"状态: 正在处理 0/{self.total_tasks}...")
         self.log_text.clear()
@@ -319,10 +361,32 @@ class MainWindow(QMainWindow):
         self._pending_urls = list(urls)
         self._output_dir = output_dir
         self._max_parallel = self.parallel_spin.value()
+        self._language = self.lang_combo.currentData()
         self._schedule_next()
+
+        # 启动看门狗定时器，防止因信号丢失导致界面卡在 99%
+        self._watchdog_timer = QTimer(self)
+        self._watchdog_timer.timeout.connect(self._check_all_finished)
+        self._watchdog_timer.start(2000)
+
+    def _check_all_finished(self) -> None:
+        """看门狗：定期检查是否所有任务都已经完成（防止信号丢失导致卡 99%）"""
+        if self.total_tasks == 0 or self._all_finished_called:
+            return
+        # 如果已完成计数已经达到总数，直接结束（信号丢失兜底）
+        if self.completed_tasks >= self.total_tasks:
+            self._on_all_finished()
+            return
+        active_count = sum(1 for w in self.workers if w.isRunning())
+        pending = len(self._pending_urls) if hasattr(self, '_pending_urls') else 0
+        if active_count == 0 and pending == 0:
+            self._on_all_finished()
 
     def _schedule_next(self) -> None:
         """调度下一个待处理的URL（控制并行数量）"""
+        if self._all_finished_called:
+            return
+
         # 清理已完成的worker
         self.workers = [w for w in self.workers if w.isRunning()]
 
@@ -337,7 +401,10 @@ class MainWindow(QMainWindow):
         # 启动新任务直到达到并行上限
         while active_count < self._max_parallel and self._pending_urls:
             url = self._pending_urls.pop(0)
-            worker = SingleUrlWorker(url, self._output_dir, auto_open=False)
+            worker = SingleUrlWorker(
+                url, self._output_dir,
+                language=self._language, auto_open=False
+            )
             worker.signals.progress.connect(self._on_task_progress)
             worker.signals.finished.connect(self._on_task_finished)
             worker.signals.error.connect(self._on_task_error)
@@ -349,8 +416,7 @@ class MainWindow(QMainWindow):
 
     def _on_task_progress(self, progress: int, message: str) -> None:
         """单个任务进度更新"""
-        # 总进度 = (已完成任务数 / 总任务数) * 100 + (当前进度 / 总任务数)
-        # 简化：显示已完成比例
+        # 总进度 = (已完成任务数 / 总任务数) * 100 + (当前任务进度 / 总任务数)
         base = (self.completed_tasks / self.total_tasks) * 100 if self.total_tasks else 0
         current = (progress / self.total_tasks) if self.total_tasks else 0
         total = int(base + current)
@@ -362,17 +428,34 @@ class MainWindow(QMainWindow):
         """单个任务完成"""
         self.completed_tasks += 1
         self._log(f"[{url}] ✅ 完成: {output_path}")
-        self._schedule_next()
+        # 如果这是最后一个任务，立即把进度推到 100% 并结束
+        if self.completed_tasks >= self.total_tasks:
+            self._on_all_finished()
+        else:
+            self._schedule_next()
 
     def _on_task_error(self, url: str, error_msg: str) -> None:
         """单个任务出错"""
         self.failed_tasks += 1
         self.completed_tasks += 1
         self._log(f"[{url}] ❌ 失败: {error_msg}")
-        self._schedule_next()
+        # 如果这是最后一个任务，立即结束
+        if self.completed_tasks >= self.total_tasks:
+            self._on_all_finished()
+        else:
+            self._schedule_next()
 
     def _on_all_finished(self) -> None:
         """全部任务完成"""
+        if self._all_finished_called:
+            return
+        self._all_finished_called = True
+
+        # 停止看门狗
+        if self._watchdog_timer and self._watchdog_timer.isActive():
+            self._watchdog_timer.stop()
+            self._watchdog_timer = None
+
         self.start_btn.setEnabled(True)
         self.progress_bar.setValue(100)
         success = self.total_tasks - self.failed_tasks
@@ -406,6 +489,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """窗口关闭时确保所有工作线程结束"""
+        if self._watchdog_timer and self._watchdog_timer.isActive():
+            self._watchdog_timer.stop()
         for worker in self.workers:
             if worker.isRunning():
                 worker.wait(3000)
